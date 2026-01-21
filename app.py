@@ -104,8 +104,15 @@ def read_data() -> pd.DataFrame:
     if df.empty:
         raise ValueError(f"El archivo Excel {DATA_FILE} está vacío o no contiene datos")
 
-    # Asegura columnas mínimas
-    for col in [COL_ESTADO, COL_MUNICIPIO, COL_PROVEEDOR, COL_SERVICIO, COL_LAT, COL_LON]:
+    # Asegura columnas mínimas (municipio puede venir como "ciudad" en algunos Excel)
+    if COL_MUNICIPIO not in df.columns:
+        if "ciudad" in df.columns:
+            df[COL_MUNICIPIO] = df["ciudad"]  # fallback: ciudad -> municipio
+        else:
+            raise ValueError(f"Falta columna requerida '{COL_MUNICIPIO}' (o 'ciudad') en {DATA_FILE}. Columnas disponibles: {list(df.columns)}")
+
+    # Verifica otras columnas requeridas
+    for col in [COL_ESTADO, COL_PROVEEDOR, COL_SERVICIO, COL_LAT, COL_LON]:
         if col not in df.columns:
             raise ValueError(f"Falta columna requerida '{col}' en {DATA_FILE}. Columnas disponibles: {list(df.columns)}")
 
