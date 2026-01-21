@@ -70,8 +70,12 @@ def normalize_service(s: Any) -> str:
         return "LLANTA"
     if "GAS" in t:
         return "GASOLINA"
-    if "CERR" in t:
+    if "CERR" in t or "APERTURA" in t or t == "APERTURA_AUTO":
         return "CERRAJERIA"
+    if "PASO" in t and "CORRIENTE" in t:
+        return "PASO_CORRIENTE"
+    if t == "CORRIENTE" or t == "BATERIA" or t == "ARRANQUE":
+        return "PASO_CORRIENTE"
     return t
 
 
@@ -88,14 +92,22 @@ def read_data() -> pd.DataFrame:
     if not os.path.exists(DATA_FILE):
         raise FileNotFoundError(f"No existe el archivo de datos: {DATA_FILE}")
 
-    df = pd.read_excel(DATA_FILE, dtype=str)  # todo como texto para no perder teléfonos
-    # Normaliza nombres de columnas a minúsculas (por si vienen raras)
-    df.columns = [str(c).strip() for c in df.columns]
+    try:
+        df = pd.read_excel(DATA_FILE, dtype=str)  # todo como texto para no perder teléfonos
+    except Exception as e:
+        raise ValueError(f"Error al leer el archivo Excel {DATA_FILE}: {str(e)}") from e
+
+    # Normaliza nombres de columnas: quita espacios, convierte a minúsculas
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+
+    # Verifica que el DataFrame no esté vacío
+    if df.empty:
+        raise ValueError(f"El archivo Excel {DATA_FILE} está vacío o no contiene datos")
 
     # Asegura columnas mínimas
     for col in [COL_ESTADO, COL_MUNICIPIO, COL_PROVEEDOR, COL_SERVICIO, COL_LAT, COL_LON]:
         if col not in df.columns:
-            raise ValueError(f"Falta columna requerida '{col}' en {DATA_FILE}")
+            raise ValueError(f"Falta columna requerida '{col}' en {DATA_FILE}. Columnas disponibles: {list(df.columns)}")
 
     # Limpieza y casting
     df[COL_PROVEEDOR] = df[COL_PROVEEDOR].apply(clean_provider_name)
@@ -120,8 +132,14 @@ TEL_COLS: List[str] = []
 def ensure_loaded():
     global DATA_DF, TEL_COLS
     if DATA_DF is None:
-        DATA_DF = read_data()
-        TEL_COLS = pick_tel_columns(DATA_DF)
+        try:
+            DATA_DF = read_data()
+            TEL_COLS = pick_tel_columns(DATA_DF)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error al cargar los datos: {str(e)}"
+            ) from e
 
 
 # =========================
@@ -133,7 +151,7 @@ class Punto(BaseModel):
 
 
 class RecomendarRequest(BaseModel):
-    servicio: str = Field(..., description="GRUA, LLANTA, GASOLINA, CERRAJERIA")
+    servicio: str = Field(..., description="GRUA, LLANTA, GASOLINA, CERRAJERIA, PASO_CORRIENTE, APERTURA_AUTO")
     top_n: int = Field(10, ge=1, le=50)
     max_km: Optional[float] = Field(None, ge=0)
     origen: Punto
@@ -182,7 +200,8 @@ def health():
 @app.get("/stats")
 def stats():
     ensure_loaded()
-    assert DATA_DF is not None
+    if DATA_DF is None:
+        raise HTTPException(status_code=500, detail="Error: datos no cargados")
     by_service = DATA_DF[COL_SERVICIO].value_counts(dropna=False).to_dict()
     return {
         "rows": int(len(DATA_DF)),
@@ -195,11 +214,13 @@ def stats():
 @app.post("/recomendar", response_model=List[ProveedorOut])
 def recomendar(req: RecomendarRequest):
     ensure_loaded()
-    assert DATA_DF is not None
+    if DATA_DF is None:
+        raise HTTPException(status_code=500, detail="Error: datos no cargados")
 
     servicio = normalize_service(req.servicio)
-    if servicio not in {"GRUA", "LLANTA", "GASOLINA", "CERRAJERIA"}:
-        raise HTTPException(status_code=422, detail=f"Servicio inválido: {req.servicio}")
+    servicios_validos = {"GRUA", "LLANTA", "GASOLINA", "CERRAJERIA", "PASO_CORRIENTE"}
+    if servicio not in servicios_validos:
+        raise HTTPException(status_code=422, detail=f"Servicio inválido: {req.servicio}. Servicios válidos: {', '.join(sorted(servicios_validos))}")
 
     df = DATA_DF.copy()
     df = df[df[COL_SERVICIO] == servicio]
@@ -212,8 +233,15 @@ def recomendar(req: RecomendarRequest):
 
     o_lat, o_lon = req.origen.lat, req.origen.lon
 
+    # Validación de coordenadas de origen
+    if not (-90 <= o_lat <= 90) or not (-180 <= o_lon <= 180):
+        raise HTTPException(status_code=422, detail="Coordenadas de origen inválidas")
+
     # distancia: por ahora usamos origen (para grúa podrías mejorar con promedio origen/destino)
-    df["_dist_km"] = df.apply(lambda r: haversine_km(o_lat, o_lon, float(r[COL_LAT]), float(r[COL_LON])), axis=1)
+    try:
+        df["_dist_km"] = df.apply(lambda r: haversine_km(o_lat, o_lon, float(r[COL_LAT]), float(r[COL_LON])), axis=1)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al calcular distancias: {str(e)}") from e
 
     if req.max_km is not None:
         df = df[df["_dist_km"] <= float(req.max_km)]
@@ -222,46 +250,57 @@ def recomendar(req: RecomendarRequest):
 
     out: List[ProveedorOut] = []
     for _, r in df.iterrows():
-        tels: List[str] = []
-        for c in TEL_COLS:
-            val = r.get(c, None)
-            if val is None or (isinstance(val, float) and pd.isna(val)) or pd.isna(val):
-                continue
-            s = str(val).strip()
-            if not s:
-                continue
-            # limpia separadores raros
-            s = re.sub(r"\s+", "", s)
-            # deja solo dígitos si trae basura
-            s_digits = re.sub(r"[^\d]", "", s)
-            if len(s_digits) >= 7:
-                tels.append(s_digits)
+        try:
+            tels: List[str] = []
+            for c in TEL_COLS:
+                val = r.get(c, None)
+                if val is None or (isinstance(val, float) and pd.isna(val)) or pd.isna(val):
+                    continue
+                s = str(val).strip()
+                if not s:
+                    continue
+                # limpia separadores raros
+                s = re.sub(r"\s+", "", s)
+                # deja solo dígitos si trae basura
+                s_digits = re.sub(r"[^\d]", "", s)
+                if len(s_digits) >= 7:
+                    tels.append(s_digits)
 
-        ubic = f"{r.get(COL_ESTADO,'').strip()} / {r.get(COL_MUNICIPIO,'').strip()}".strip(" /")
+            ubic = f"{r.get(COL_ESTADO,'').strip()} / {r.get(COL_MUNICIPIO,'').strip()}".strip(" /")
 
-        notas = ""
-        if COL_NOTAS in DATA_DF.columns:
-            notas = "" if pd.isna(r.get(COL_NOTAS)) else str(r.get(COL_NOTAS)).strip()
+            notas = ""
+            if COL_NOTAS in DATA_DF.columns:
+                notas = "" if pd.isna(r.get(COL_NOTAS)) else str(r.get(COL_NOTAS)).strip()
 
-        email = None
-        if COL_EMAIL in DATA_DF.columns:
-            ev = r.get(COL_EMAIL)
-            if ev is not None and not pd.isna(ev):
-                email = str(ev).strip() or None
+            email = None
+            if COL_EMAIL in DATA_DF.columns:
+                ev = r.get(COL_EMAIL)
+                if ev is not None and not pd.isna(ev):
+                    email = str(ev).strip() or None
 
-        out.append(
-            ProveedorOut(
-                proveedor=str(r.get(COL_PROVEEDOR, "")).strip(),
-                servicio=servicio,
-                dist_km=float(r["_dist_km"]),
-                estado=str(r.get(COL_ESTADO, "")).strip(),
-                municipio=str(r.get(COL_MUNICIPIO, "")).strip(),
-                ubicacion=ubic,
-                lat=float(r[COL_LAT]),
-                lon=float(r[COL_LON]),
-                telefonos=tels,
-                email=email,
-                notas=notas,
+            # Validación de coordenadas antes de agregar
+            lat_val = float(r[COL_LAT])
+            lon_val = float(r[COL_LON])
+            if not (-90 <= lat_val <= 90) or not (-180 <= lon_val <= 180):
+                continue  # Salta filas con coordenadas inválidas
+
+            out.append(
+                ProveedorOut(
+                    proveedor=str(r.get(COL_PROVEEDOR, "")).strip(),
+                    servicio=servicio,
+                    dist_km=float(r["_dist_km"]),
+                    estado=str(r.get(COL_ESTADO, "")).strip(),
+                    municipio=str(r.get(COL_MUNICIPIO, "")).strip(),
+                    ubicacion=ubic,
+                    lat=lat_val,
+                    lon=lon_val,
+                    telefonos=tels,
+                    email=email,
+                    notas=notas,
+                )
             )
-        )
+        except Exception as e:
+            # Log del error pero continúa con las demás filas
+            # En producción podrías usar logging aquí
+            continue
     return out
