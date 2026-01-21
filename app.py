@@ -210,11 +210,19 @@ def stats():
     if DATA_DF is None:
         raise HTTPException(status_code=500, detail="Error: datos no cargados")
     by_service = DATA_DF[COL_SERVICIO].value_counts(dropna=False).to_dict()
+    
+    # Contar cuántos tienen coordenadas válidas
+    with_coords = DATA_DF[(DATA_DF[COL_LAT].notna()) & (DATA_DF[COL_LON].notna())]
+    by_service_with_coords = with_coords[COL_SERVICIO].value_counts(dropna=False).to_dict()
+    
     return {
         "rows": int(len(DATA_DF)),
+        "rows_with_coords": int(len(with_coords)),
         "by_service": by_service,
+        "by_service_with_coords": by_service_with_coords,
         "data_file": DATA_FILE,
         "tel_cols": TEL_COLS,
+        "unique_services": sorted(DATA_DF[COL_SERVICIO].dropna().unique().tolist()),
     }
 
 
@@ -230,12 +238,26 @@ def recomendar(req: RecomendarRequest):
         raise HTTPException(status_code=422, detail=f"Servicio inválido: {req.servicio}. Servicios válidos: {', '.join(sorted(servicios_validos))}")
 
     df = DATA_DF.copy()
+    
+    # Debug: ver qué servicios hay en el Excel
+    servicios_disponibles = df[COL_SERVICIO].unique().tolist()
+    
     df = df[df[COL_SERVICIO] == servicio]
+    
+    # Debug: contar antes de filtrar geocodificados
+    count_antes_geo = len(df)
 
     # Filtra geocodificados
     df = df[df[COL_LAT].notna() & df[COL_LON].notna()]
+    
+    # Debug: contar después de filtrar geocodificados
+    count_despues_geo = len(df)
 
     if df.empty:
+        # Log útil para debug (en producción podrías usar logging)
+        print(f"[DEBUG] Servicio '{servicio}' (normalizado de '{req.servicio}'): "
+              f"0 resultados. Servicios disponibles en Excel: {servicios_disponibles[:10]}. "
+              f"Antes de filtrar geo: {count_antes_geo}, después: {count_despues_geo}")
         return []
 
     o_lat, o_lon = req.origen.lat, req.origen.lon
